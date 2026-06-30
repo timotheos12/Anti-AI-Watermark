@@ -1,69 +1,108 @@
 #!/usr/bin/env python3
 """
-adversarial_watermark.py  (v2 — imperceptible)
+adversarial_watermark_laion.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Adds an adversarial perturbation to an image so that CLIP-style watermark
-classifiers (the LAION pwatermark filter used by img2dataset / datacomp)
-tag it as 'watermark' — causing dataset-curation pipelines to EXCLUDE the
-image from AI training sets. A self-protection tool for image owners.
+Same imperceptible adversarial watermark injector, but loads the LAION
+watermark_model_v1.pt weights directly (no Hugging Face dependency).
 
-What changed from v1 (why it was visible, and the fixes):
-
-  1. FULL-RESOLUTION OPTIMISATION
-     v1 optimised at 224x224 then upscaled the delta — bilinear upsampling
-     smears the perturbation into broad low-frequency blotches that the eye
-     catches easily. v2 keeps a full-res delta and only downsamples to feed
-     the classifier (downsampling is smooth and differentiable), so the
-     perturbation lives at the native pixel scale where it hides better.
-
-  2. PERCEPTUAL MASKING
-     The human eye tolerates far more change in busy/high-texture regions
-     than in flat ones (luminance + contrast masking). v2 computes a local
-     gradient-magnitude map and scales the allowed perturbation by it, so
-     noise concentrates in edges/texture and stays out of smooth skies and
-     skin where it would be obvious.
-
-  3. LPIPS-STYLE SMOOTHNESS PENALTY
-     A total-variation term in the loss suppresses isolated speckle (the
-     salt-and-pepper look) in favour of smooth, structured perturbations
-     that read as natural texture.
-
-  4. YUV-WEIGHTED UPDATES
-     The eye is least sensitive to chroma. v2 lets the optimiser push harder
-     on chroma than on luminance, gaining classifier signal for less visible
-     change.
+FIX INCLUDED: the official LAION checkpoint was saved together with its
+training optimizer's state (Google's "Scalable Shampoo" optimizer). Plain
+torch.load() fails with `ModuleNotFoundError: No module named
+'scalable_shampoo'` because pickle tries to reconstruct that optimizer
+object too, even though we only need the model weights. This script uses
+a tolerant unpickler that substitutes a harmless placeholder for any class
+it can't import, then extracts just the real tensor weights afterward.
 
 Install:
-    pip install torch torchvision transformers pillow numpy
+    pip install torch torchvision timm pillow numpy
+
+Setup:
+    Download watermark_model_v1.pt from:
+    https://github.com/LAION-AI/LAION-5B-WatermarkDetection/releases/tag/1.0
+    and place it next to this script (or pass --weights <path>).
 
 Usage:
-    python adversarial_watermark.py photo.jpg protected.png
-    python adversarial_watermark.py photo.jpg protected.png --epsilon 6 --steps 300
-    python adversarial_watermark.py photo.jpg protected.png --target 0.9 --device cuda
-
-    --epsilon   Max luminance Δ per channel, 0-255  (default: 6)
-                This is now a CEILING on the *masked* perturbation; the
-                average change is much lower, so 6 is already very subtle.
-    --steps     Optimisation iterations               (default: 250)
-    --target    Stop early once this watermark prob is reached (default: 0.85)
-    --tv        Smoothness penalty weight             (default: 0.08)
-    --chroma    Chroma-vs-luma push ratio, >=1        (default: 2.0)
-    --device    auto | cpu | cuda | mps               (default: auto)
+    python adversarial_watermark_laion.py photo.jpg protected.png
+    python adversarial_watermark_laion.py photo.jpg protected.png --epsilon 6 --steps 300
 """
 
 import argparse
+import os
+import pickle
 import sys
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from transformers import AutoImageProcessor, AutoModelForImageClassification
 
-MODEL_ID = "amrul-hzz/watermark_detector"
+try:
+    import timm
+except ImportError:
+    sys.exit("[!] Missing dependency. Run:  pip install timm")
+
+DEFAULT_WEIGHTS = "watermark_model_v1.pt"
+
+WM_MEAN = [0.485, 0.456, 0.406]
+WM_STD  = [0.229, 0.224, 0.225]
+WM_SIZE = 224
+WM_INDEX = 0   # class 0 = "watermark" in the LAION head
 
 
-# ── Device ─────────────────────────────────────────────────────────────────
+# ── Tolerant checkpoint loading ─────────────────────────────────────────────
+# Fixes: ModuleNotFoundError: No module named 'scalable_shampoo'
+
+class _DummyClass:
+    """Stand-in for any class the unpickler can't import. We only need the
+    plain tensors that make up the model weights, so anything pickle can't
+    resolve (optimizer internals, etc.) is safely discarded as one of these."""
+    def __new__(cls, *args, **kwargs):
+        return object.__new__(cls)
+    def __setstate__(self, state):
+        pass
+    def __reduce__(self):
+        return (_DummyClass, ())
+
+
+class _TolerantUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        try:
+            return super().find_class(module, name)
+        except (ModuleNotFoundError, AttributeError, ImportError):
+            return _DummyClass
+
+
+class _TolerantPickleModule:
+    """Drop-in replacement for the `pickle` module, passed to torch.load()
+    via its `pickle_module=` argument."""
+    Unpickler = _TolerantUnpickler
+    Pickler = pickle.Pickler
+    load = pickle.load
+    dump = pickle.dump
+    HIGHEST_PROTOCOL = pickle.HIGHEST_PROTOCOL
+    UnpicklingError = pickle.UnpicklingError
+
+
+def _extract_state_dict(obj):
+    """Checkpoints vary in shape (bare state_dict, or wrapped in a dict with
+    'model'/'state_dict'/etc. keys alongside optimizer state). Find the
+    dict of {name: tensor} and drop anything that isn't a real tensor."""
+    candidates = [obj]
+    if isinstance(obj, dict):
+        for key in ("state_dict", "model_state_dict", "model", "net", "weights"):
+            if key in obj:
+                candidates.append(obj[key])
+
+    for cand in candidates:
+        if isinstance(cand, dict):
+            tensors = {k: v for k, v in cand.items() if torch.is_tensor(v)}
+            if len(tensors) > 5:
+                return tensors
+    sys.exit("[!] Could not find a usable weight dictionary inside the checkpoint.")
+
+
+# ── Device ───────────────────────────────────────────────────────────────────
 
 def pick_device(pref: str) -> torch.device:
     if pref != "auto":
@@ -75,7 +114,7 @@ def pick_device(pref: str) -> torch.device:
     return torch.device("cpu")
 
 
-# ── Image helpers ───────────────────────────────────────────────────────────
+# ── Image helpers ────────────────────────────────────────────────────────────
 
 def img_to_tensor(pil_img: Image.Image, device) -> torch.Tensor:
     arr = np.array(pil_img.convert("RGB"), dtype=np.float32) / 255.0
@@ -87,132 +126,126 @@ def tensor_to_img(t: torch.Tensor) -> Image.Image:
     return Image.fromarray((arr * 255.0).round().astype(np.uint8))
 
 
-def normalize(x, mean, std, device):
-    m = torch.tensor(mean, device=device).view(1, 3, 1, 1)
-    s = torch.tensor(std,  device=device).view(1, 3, 1, 1)
+def normalize(x, device):
+    m = torch.tensor(WM_MEAN, device=device).view(1, 3, 1, 1)
+    s = torch.tensor(WM_STD,  device=device).view(1, 3, 1, 1)
     return (x - m) / s
 
 
-def model_input_size(processor):
-    size = processor.size
-    if isinstance(size, dict):
-        if "height" in size and "width" in size:
-            return int(size["height"]), int(size["width"])
-        if "shortest_edge" in size:
-            e = int(size["shortest_edge"]); return e, e
-    if isinstance(size, int):
-        return size, size
-    return 224, 224
-
-
-# ── Perceptual masking ──────────────────────────────────────────────────────
+# ── Perceptual masking ───────────────────────────────────────────────────────
 
 def perceptual_mask(img: torch.Tensor) -> torch.Tensor:
-    """
-    Per-pixel tolerance map in [0,1]. High where the eye is forgiving
-    (textured/edge regions), low in flat regions. Based on local gradient
-    magnitude of luminance, smoothed and normalised.
-    """
     r, g, b = img[:, 0:1], img[:, 1:2], img[:, 2:3]
     lum = 0.299 * r + 0.587 * g + 0.114 * b
-
-    # Sobel gradients
     kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
                       dtype=img.dtype, device=img.device).view(1, 1, 3, 3)
     ky = kx.transpose(2, 3)
     gx = F.conv2d(lum, kx, padding=1)
     gy = F.conv2d(lum, ky, padding=1)
     grad = torch.sqrt(gx * gx + gy * gy + 1e-8)
-
-    # Smooth so the mask isn't itself a high-freq pattern
     blur = torch.ones(1, 1, 5, 5, device=img.device, dtype=img.dtype) / 25.0
     grad = F.conv2d(grad, blur, padding=2)
-
-    # Normalise to [0,1] and give flat regions a small floor so they still
-    # receive a little perturbation (the classifier needs global signal)
     grad = grad / (grad.amax() + 1e-8)
-    return 0.15 + 0.85 * grad     # floor 0.15, ceiling 1.0
+    return 0.15 + 0.85 * grad
 
 
 def total_variation(delta: torch.Tensor) -> torch.Tensor:
-    """Anisotropic TV — penalises high-frequency speckle, rewards smooth texture."""
     dh = (delta[:, :, 1:, :] - delta[:, :, :-1, :]).abs().mean()
     dw = (delta[:, :, :, 1:] - delta[:, :, :, :-1]).abs().mean()
     return dh + dw
 
 
-# ── YUV channel weighting ───────────────────────────────────────────────────
-# Push chroma harder than luma since the eye is least sensitive to colour error.
-
 def yuv_weight_map(chroma_ratio: float, device) -> torch.Tensor:
-    # Approx per-RGB-channel visibility weights; lower weight = optimiser allowed
-    # to move it more. Blue carries least luminance, so it tolerates the most.
     w_luma = torch.tensor([0.6, 1.0, 0.45], device=device).view(1, 3, 1, 1)
     return w_luma / chroma_ratio + (1 - 1 / chroma_ratio)
 
 
-# ── Inference ───────────────────────────────────────────────────────────────
+# ── Inference ────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def watermark_prob(model, processor, img_full, wm_idx, mh, mw, device):
-    small = F.interpolate(img_full, size=(mh, mw), mode="area")
-    nx = normalize(small, processor.image_mean, processor.image_std, device)
-    return F.softmax(model(pixel_values=nx).logits, dim=-1)[0, wm_idx].item()
+def watermark_prob(model, img_full, device):
+    small = F.interpolate(img_full, size=(WM_SIZE, WM_SIZE), mode="area")
+    nx = normalize(small, device)
+    return F.softmax(model(nx), dim=-1)[0, WM_INDEX].item()
 
 
-# ── Model ───────────────────────────────────────────────────────────────────
+# ── Model ────────────────────────────────────────────────────────────────────
 
-def load_model(device):
-    print(f"[*] Loading {MODEL_ID} …")
-    processor = AutoImageProcessor.from_pretrained(MODEL_ID)
-    model = AutoModelForImageClassification.from_pretrained(MODEL_ID).to(device).eval()
-    labels = model.config.id2label
-    print(f"    Labels: {labels}")
-    wm_idx = next((k for k, v in labels.items() if "watermark" in v.lower()), 1)
-    print(f"    Watermark → index {wm_idx} ('{labels[wm_idx]}')")
-    return processor, model, wm_idx
+class WatermarkModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = timm.create_model("efficientnet_b3", pretrained=False, num_classes=2)
+
+    def forward(self, x):
+        return self.model(x)
 
 
-# ── Optimisation ────────────────────────────────────────────────────────────
+def load_model(device, weights_path):
+    if not os.path.isfile(weights_path):
+        sys.exit(
+            f"[!] Weights file not found: {weights_path}\n"
+            f"    Download 'watermark_model_v1.pt' from:\n"
+            f"    https://github.com/LAION-AI/LAION-5B-WatermarkDetection/releases/tag/1.0"
+        )
+    print(f"[*] Loading weights from {weights_path} …")
 
-def optimise(model, processor, orig, wm_idx, mh, mw,
-             eps, steps, target, tv_weight, chroma_ratio, device):
-    """
-    Full-resolution adversarial optimisation with perceptual masking,
-    TV smoothness, and chroma-weighted, mask-scaled L∞ projection.
-    """
-    mask = perceptual_mask(orig)              # [1,1,H,W]
-    chan_w = yuv_weight_map(chroma_ratio, device)   # [1,3,1,1]
+    raw = torch.load(
+        weights_path, map_location="cpu",
+        pickle_module=_TolerantPickleModule, weights_only=False,
+    )
+    state = _extract_state_dict(raw)
+    print(f"    Found {len(state)} weight tensors in checkpoint.")
 
-    # Effective per-pixel, per-channel epsilon ball (in [0,1] scale)
-    eps_map = eps * mask * chan_w             # broadcast → [1,3,H,W]
+    model = WatermarkModel()
+    cleaned = {}
+    for k, v in state.items():
+        nk = k.replace("module.", "")
+        if not nk.startswith("model."):
+            nk = "model." + nk
+        cleaned[nk] = v
+
+    missing, unexpected = model.load_state_dict(cleaned, strict=False)
+    matched = len(cleaned) - len(unexpected)
+    print(f"    Matched {matched}/{len(cleaned)} tensors to the model "
+          f"({len(missing)} missing, {len(unexpected)} unexpected).")
+    if matched < len(cleaned) * 0.5:
+        print("    ⚠  Less than half the weights matched — the architecture may not")
+        print("       line up with this checkpoint. Confidence scores may be unreliable.")
+
+    model = model.to(device).eval()
+    return model
+
+
+# ── Optimisation ─────────────────────────────────────────────────────────────
+
+def optimise(model, orig, eps, steps, target, tv_weight, chroma_ratio, device):
+    mask = perceptual_mask(orig)
+    chan_w = yuv_weight_map(chroma_ratio, device)
+    eps_map = eps * mask * chan_w
 
     delta = torch.zeros_like(orig).uniform_(-1e-3, 1e-3)
     delta = (orig + delta).clamp(0, 1) - orig
     best_delta, best_prob = delta.clone(), 0.0
 
-    mean, std = processor.image_mean, processor.image_std
-    # Adam adapts step size per pixel → smoother convergence than sign-SGD
     delta.requires_grad_(True)
-    opt = torch.optim.Adam([delta], lr=eps.mean().item() / 12 if torch.is_tensor(eps) else eps / 12)
+    opt = torch.optim.Adam([delta], lr=eps / 12)
 
     for step in range(steps):
         opt.zero_grad()
         perturbed = (orig + delta).clamp(0, 1)
-        small = F.interpolate(perturbed, size=(mh, mw), mode="area")
-        logits = model(pixel_values=normalize(small, mean, std, device)).logits
+        small = F.interpolate(perturbed, size=(WM_SIZE, WM_SIZE), mode="area")
+        logits = model(normalize(small, device))
         probs = F.softmax(logits, dim=-1)
 
-        loss = -torch.log(probs[0, wm_idx] + 1e-8) + tv_weight * total_variation(delta)
+        loss = -torch.log(probs[0, WM_INDEX] + 1e-8) + tv_weight * total_variation(delta)
         loss.backward()
         opt.step()
 
         with torch.no_grad():
-            # Project onto the per-pixel masked epsilon ball, then valid pixels
             delta.clamp_(-eps_map, eps_map)
             delta.copy_((orig + delta).clamp(0, 1) - orig)
 
-            prob = probs[0, wm_idx].item()
+            prob = probs[0, WM_INDEX].item()
             if prob > best_prob:
                 best_prob, best_delta = prob, delta.detach().clone()
 
@@ -227,12 +260,10 @@ def optimise(model, processor, orig, wm_idx, mh, mw,
     return best_delta, best_prob
 
 
-# ── Main ────────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="Imperceptible adversarial watermark injection (v2)",
-        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap = argparse.ArgumentParser(description="LAION-weights adversarial watermark injection")
     ap.add_argument("input")
     ap.add_argument("output")
     ap.add_argument("--epsilon", type=float, default=6.0)
@@ -240,6 +271,7 @@ def main():
     ap.add_argument("--target",  type=float, default=0.85)
     ap.add_argument("--tv",      type=float, default=0.08)
     ap.add_argument("--chroma",  type=float, default=2.0)
+    ap.add_argument("--weights", default=DEFAULT_WEIGHTS)
     ap.add_argument("--device",  default="auto")
     args = ap.parse_args()
 
@@ -255,26 +287,24 @@ def main():
     w, h = orig_pil.size
     print(f"    Size: {w}×{h}")
 
-    processor, model, wm_idx = load_model(device)
-    mh, mw = model_input_size(processor)
-
+    model = load_model(device, args.weights)
     orig = img_to_tensor(orig_pil, device)
 
-    base = watermark_prob(model, processor, orig, wm_idx, mh, mw, device)
+    base = watermark_prob(model, orig, device)
     print(f"\n[*] Baseline watermark confidence: {base:.4f}")
+    if base < 0.05:
+        print("    ⚠  Very low baseline on what may be a watermark-free test image is normal.")
+        print("       But if this seems wrong on a known-watermarked test photo, the weight")
+        print("       mapping above likely didn't line up — see the match ratio printed earlier.")
 
     print(f"\n[*] Optimising  ε≤{args.epsilon}/255 (masked)  "
           f"tv={args.tv}  chroma×{args.chroma}  {args.steps} steps\n")
-    delta, final = optimise(model, processor, orig, wm_idx, mh, mw,
-                            eps, args.steps, args.target,
+    delta, final = optimise(model, orig, eps, args.steps, args.target,
                             args.tv, args.chroma, device)
 
     result = (orig + delta).clamp(0, 1)
     out_img = tensor_to_img(result)
-
-    verified = watermark_prob(model, processor,
-                              img_to_tensor(out_img, device),
-                              wm_idx, mh, mw, device)
+    verified = watermark_prob(model, img_to_tensor(out_img, device), device)
 
     d = (delta.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0)
     mse = (d ** 2).mean()
@@ -291,7 +321,7 @@ def main():
     if verified < 0.5:
         print("[!] Below 0.5 — try --epsilon 8 --steps 400 --target 0.9")
     elif verified < args.target:
-        print("[~] Below target but may still clear filters; raise --epsilon slightly if needed.")
+        print("[~] Below target but may still clear filters.")
     else:
         print("[✓] Clears typical pwatermark thresholds (0.3–0.5) with margin.")
 
